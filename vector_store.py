@@ -1,5 +1,4 @@
 import chromadb
-from chromadb.config import Settings
 from openai import OpenAI
 
 
@@ -21,7 +20,7 @@ def _get_openai(api_key: str) -> OpenAI:
 def _get_collection() -> chromadb.Collection:
     global _chroma, _collection
     if _chroma is None:
-        _chroma = chromadb.Client(Settings(anonymized_telemetry=False))
+        _chroma = chromadb.EphemeralClient()
     if _collection is None:
         _collection = _chroma.get_or_create_collection(
             name=COLLECTION_NAME,
