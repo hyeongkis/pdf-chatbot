@@ -1,109 +1,90 @@
-import chromadb
+from __future__ import annotations
+
+import math
+from typing import Dict, List, Optional
 from openai import OpenAI
 
-
-_client: OpenAI | None = None
-_chroma: chromadb.ClientAPI | None = None
-_collection: chromadb.Collection | None = None
-
-COLLECTION_NAME = "pdf_chunks"
 EMBED_MODEL = "text-embedding-3-small"
+
+# 인메모리 저장소
+_store: Dict[str, dict] = {}   # id -> {text, source, page, embedding}
+_openai_client: Optional[OpenAI] = None
 
 
 def _get_openai(api_key: str) -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI(api_key=api_key)
-    return _client
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
 
 
-def _get_collection() -> chromadb.Collection:
-    global _chroma, _collection
-    if _chroma is None:
-        _chroma = chromadb.EphemeralClient()
-    if _collection is None:
-        _collection = _chroma.get_or_create_collection(
-            name=COLLECTION_NAME,
-            metadata={"hnsw:space": "cosine"},
-        )
-    return _collection
-
-
-def embed_texts(texts: list[str], api_key: str) -> list[list[float]]:
+def _embed(texts: List[str], api_key: str) -> List[List[float]]:
     client = _get_openai(api_key)
     response = client.embeddings.create(model=EMBED_MODEL, input=texts)
     return [item.embedding for item in response.data]
 
 
-def add_chunks(chunks: list[dict], api_key: str) -> int:
-    collection = _get_collection()
+def _cosine(a: List[float], b: List[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
-    # 이미 로드된 source 파일 목록 확인
-    existing = collection.get(include=["metadatas"])
-    existing_sources = {m["source"] for m in existing["metadatas"]} if existing["metadatas"] else set()
 
+def add_chunks(chunks: List[dict], api_key: str) -> int:
+    existing_sources = {v["source"] for v in _store.values()}
     new_chunks = [c for c in chunks if c["source"] not in existing_sources]
     if not new_chunks:
         return 0
 
     texts = [c["text"] for c in new_chunks]
-    embeddings = embed_texts(texts, api_key)
+    embeddings = _embed(texts, api_key)
 
-    ids = [f"{c['source']}__p{c['page']}__c{c['chunk_index']}" for c in new_chunks]
-    metadatas = [{"source": c["source"], "page": c["page"]} for c in new_chunks]
-
-    collection.add(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+    for chunk, emb in zip(new_chunks, embeddings):
+        chunk_id = f"{chunk['source']}__p{chunk['page']}__c{chunk['chunk_index']}"
+        _store[chunk_id] = {
+            "text": chunk["text"],
+            "source": chunk["source"],
+            "page": chunk["page"],
+            "embedding": emb,
+        }
     return len(new_chunks)
 
 
-def search(query: str, api_key: str, n_results: int = 5) -> list[dict]:
-    collection = _get_collection()
-    if collection.count() == 0:
+def search(query: str, api_key: str, n_results: int = 5) -> List[dict]:
+    if not _store:
         return []
 
-    query_embedding = embed_texts([query], api_key)[0]
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(n_results, collection.count()),
-        include=["documents", "metadatas", "distances"],
-    )
+    query_emb = _embed([query], api_key)[0]
+    scored = [
+        (chunk_id, _cosine(query_emb, v["embedding"]))
+        for chunk_id, v in _store.items()
+    ]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = scored[:n_results]
 
-    hits = []
-    for doc, meta, dist in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0],
-    ):
-        hits.append({
-            "text": doc,
-            "source": meta["source"],
-            "page": meta["page"],
-            "score": 1 - dist,  # cosine similarity
-        })
-    return hits
+    return [
+        {
+            "text": _store[cid]["text"],
+            "source": _store[cid]["source"],
+            "page": _store[cid]["page"],
+            "score": score,
+        }
+        for cid, score in top
+    ]
 
 
-def list_sources() -> list[str]:
-    collection = _get_collection()
-    if collection.count() == 0:
-        return []
-    result = collection.get(include=["metadatas"])
-    return sorted({m["source"] for m in result["metadatas"]})
+def list_sources() -> List[str]:
+    return sorted({v["source"] for v in _store.values()})
 
 
 def remove_source(source: str) -> None:
-    collection = _get_collection()
-    result = collection.get(include=["metadatas"])
-    ids_to_delete = [
-        id_ for id_, meta in zip(result["ids"], result["metadatas"])
-        if meta["source"] == source
-    ]
-    if ids_to_delete:
-        collection.delete(ids=ids_to_delete)
+    to_delete = [k for k, v in _store.items() if v["source"] == source]
+    for k in to_delete:
+        del _store[k]
 
 
 def reset_collection() -> None:
-    global _collection
-    if _chroma is not None:
-        _chroma.delete_collection(COLLECTION_NAME)
-        _collection = None
+    _store.clear()
