@@ -9,12 +9,14 @@ EMBED_MODEL = "text-embedding-3-small"
 # 인메모리 저장소
 _store: Dict[str, dict] = {}   # id -> {text, source, page, embedding}
 _openai_client: Optional[OpenAI] = None
+_cached_api_key: Optional[str] = None
 
 
 def _get_openai(api_key: str) -> OpenAI:
-    global _openai_client
-    if _openai_client is None:
+    global _openai_client, _cached_api_key
+    if _openai_client is None or _cached_api_key != api_key:
         _openai_client = OpenAI(api_key=api_key)
+        _cached_api_key = api_key
     return _openai_client
 
 
